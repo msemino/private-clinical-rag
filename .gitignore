@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# Local vector store (never commit an indexed corpus)
+.chroma/
+.chroma_selftest/
+*.sqlite3
+
+# Environment
+.env
+
+# Private corpora — NEVER commit copyrighted or clinical material
+data/private/
+data/**/*.pdf
+!data/sample/**
