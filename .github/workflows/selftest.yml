@@ -1,0 +1,24 @@
+name: selftest
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  selftest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      # cmd_selftest forces the offline HashEmbedder, so the whole pipeline
+      # runs end to end here with no Ollama and no GPU: ingest -> retrieve ->
+      # cited answer -> off-topic query refused.
+      - run: python -m src.ask selftest

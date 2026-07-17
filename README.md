@@ -9,6 +9,7 @@
 ![Ollama](https://img.shields.io/badge/LLM-Ollama%20(local)-000000?logo=ollama&logoColor=white)
 ![Privacy](https://img.shields.io/badge/Data%20egress-zero-3DA639)
 ![License](https://img.shields.io/badge/License-MIT-blue)
+[![selftest](https://github.com/msemino/private-clinical-rag/actions/workflows/selftest.yml/badge.svg)](https://github.com/msemino/private-clinical-rag/actions/workflows/selftest.yml)
 
 ---
 
@@ -38,20 +39,41 @@ machine.
 
 ## Architecture
 
+Two separate commands over the same local store. Every box below maps to real
+code — the table after the diagram gives the file and function for each one.
+
 ```mermaid
 flowchart LR
     subgraph Local["🖥️  Your machine — nothing leaves it"]
-        DOC[/"Your manual<br/>(Markdown)"/] --> ING["Ingest<br/>hierarchical chunking<br/>+ metadata"]
-        ING -->|embeddings| EMB{{"Embedder<br/>Ollama · local"}}
-        EMB --> VDB[("ChromaDB<br/>persistent, on-disk")]
-        Q(["Question"]) --> RET["Retrieve<br/>vector search → re-rank"]
-        VDB --> RET
-        RET --> GATE{"top score<br/>≥ MIN_SCORE?"}
-        GATE -- no --> REF["Refuse:<br/>'not in the manual'"]
-        GATE -- yes --> LLM{{"LLM<br/>Ollama · local"}}
-        LLM --> ANS["Answer<br/>+ [S#] citations"]
+        subgraph Ingest["python -m src.ask ingest"]
+            DOC[/"Your manual<br/>(Markdown)"/] --> ING["Hierarchical chunking<br/>≤ 1200 chars · orphans dropped<br/>+ metadata per chunk"]
+            ING -->|embeddings| EMB{{"Embedder<br/>Ollama · nomic-embed-text"}}
+            EMB --> VDB[("ChromaDB<br/>on-disk · cosine")]
+        end
+        subgraph Ask["python -m src.ask ask"]
+            Q(["Question"]) --> RET["Vector search<br/>top_k = 8"]
+            RET --> RR["Re-rank → final_k = 4<br/>0.65·cosine + 0.35·lexical<br/>+ 0.10 heading boost"]
+            RR --> GATE{"top score<br/>≥ MIN_SCORE 0.15 ?"}
+            GATE -- no --> REF["REFUSAL<br/>'not in the provided manual'<br/>the model is never called"]
+            GATE -- yes --> LLM{{"LLM<br/>Ollama · llama3.1:8b"}}
+            LLM --> ANS["Answer<br/>+ [S#] citations"]
+        end
+        VDB -.-> RET
     end
 ```
+
+| Box | Where it lives |
+|---|---|
+| Hierarchical chunking | `src/ingest.py` — `parse_markdown()` walks the heading tree, `_split_text()` caps pieces at `_MAX_CHARS = 1200`; `flush()` drops a body with no heading parent instead of indexing it half-blind |
+| Embedder | `src/embeddings.py` — `OllamaEmbedder` (prod) / `HashEmbedder` (offline), chosen by `get_embedder()` |
+| ChromaDB | `src/ingest.py` — `PersistentClient` + `create_collection(metadata={"hnsw:space": "cosine"})`. Re-ingesting rebuilds the collection, so it never duplicates |
+| Vector search | `src/retrieve.py` — `collection.query(n_results=config.top_k)`; `TOP_K = 8` in `src/config.py` |
+| Re-rank | `src/retrieve.py` — `_rerank()`: `0.65 * vec_score + 0.35 * overlap + heading_boost`, `heading_boost = 0.10`; keeps `FINAL_K = 4` |
+| Refusal gate | `src/llm.py` — `if not contexts or contexts[0]["score"] < config.min_score: return REFUSAL`; `MIN_SCORE = 0.15` |
+| LLM | `src/llm.py` — `_ollama_chat()` → `POST /api/generate`, `LLM_MODEL = llama3.1:8b` |
+
+**See it animated:** the [project page](https://private-clinical-rag.vercel.app) runs these three
+paths — indexing, a grounded answer, and the refusal — as a live diagram.
 
 ---
 
@@ -102,7 +124,7 @@ Every answer comes back with the section path of each source it used.
 | **Refusal gate** | If the best chunk scores below `MIN_SCORE`, the system returns *"I can't find this in the provided manual"* instead of hallucinating. |
 | **Citations** | The prompt forbids outside knowledge and requires inline `[S#]` tags; sources are printed with every answer. |
 | **Local by construction** | Embeddings (Ollama), vector store (ChromaDB on disk), and generation (Ollama) all run on your hardware. **Zero data egress.** |
-| **Pluggable embedder** | `OllamaEmbedder` for production, `HashEmbedder` for offline/CI — same interface, so the pipeline is testable without any service running. |
+| **Pluggable embedder** | `OllamaEmbedder` for production, `HashEmbedder` for offline/CI — same interface, so the pipeline is testable without any service running. CI runs `python -m src.ask selftest` on every push: the full contract is checked with no Ollama and no GPU. |
 
 ### Query flow
 
@@ -146,6 +168,29 @@ copyrighted manual. To use it for real:
 > 🩺 **Not medical advice.** This is a retrieval-and-citation tool over a manual,
 > not a diagnostic system. It summarizes the document you give it; it does not
 > reason about individuals.
+
+---
+
+## The trade-off, stated plainly
+
+The refusal gate is the point of this project, so its limits should be as legible
+as its wins. Both of these are observable in the self-test output:
+
+* **It reads `contexts[0]` only.** The gate compares the *top* chunk's score to
+  `MIN_SCORE`. The remaining `final_k - 1` chunks that fill the prompt are never
+  gated individually — in the offline self-test, the fourth cited source scores
+  **0.00** and still reaches the model. That is survivable because the score
+  travels with every citation (`llm.py`) and is printed next to it (`ask.py`), so
+  a reader can see exactly how thin a source was. But the gate does not stop it.
+* **The score is a blend, not a cross-encoder.** A correct answer worded
+  differently from the manual can fall under `MIN_SCORE` and be refused anyway:
+  fewer wrong answers, but also fewer answers. Raising `MIN_SCORE` trades recall
+  for caution; lowering it does the reverse. In a clinical reference setting the
+  default leans toward refusing.
+* **The offline embedder is not a real one.** `HashEmbedder` is deterministic
+  bag-of-words. It exists so the pipeline is provable end-to-end with zero
+  services — it is not a substitute for `nomic-embed-text`, and the scores it
+  produces are not the scores you get in production.
 
 ---
 
